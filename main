@@ -1,0 +1,805 @@
+import os
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
+os.environ["STREAMLIT_SERVER_RUN_ON_SAVE"] = "false"
+
+import re, time, json, hashlib, sqlite3, pathlib, glob, base64, uuid
+from typing import List, Tuple, Dict
+import numpy as np
+import pandas as pd
+import streamlit as st
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+
+# ------------------------- Streamlit Ayarları -------------------------
+st.set_page_config(
+    page_title="Space Biology Engine",
+    layout="wide",
+    page_icon="TED BOLU KOLEJİ"
+)
+
+# ------------------------- Yollar & Sabitler -------------------------
+TEMEL_DIZIN        = r"C:\Users\SA\Desktop\NASA_FINAL"
+VERI_DIZINI        = os.path.join(TEMEL_DIZIN, "ARASTIRMALAR")             # Kaynak klasör
+ONBELLEK_DIZINI    = os.path.join(TEMEL_DIZIN, "_INDEX_CACHE")             # DB/metalar
+VT_YOLU            = os.path.join(ONBELLEK_DIZINI, "spacebio_index.sqlite3")
+MODEL_ADI          = "sentence-transformers/all-MiniLM-L6-v2"
+
+UYGULAMA_LOGO_YOLU = os.path.join(TEMEL_DIZIN, "SPACE_APP_LOGO.png")       # Banner için logo
+ATA_GORSEL_YOLU    = os.path.join(TEMEL_DIZIN, "ata.png")                  # Sidebar görseli (butonun altına)
+AFIS_GENISLIK_PX   = 1000  # Banner genişliği (px)
+
+AZAMI_DILIM_KELIME = 900
+DILIM_BINDIRME     = 150
+ENIYI_KAYNAK_SAYISI = 20
+ENIYI_DILIM_SAYISI   = 60
+OZET_CUMLE_ADEDI     = 10
+
+os.makedirs(ONBELLEK_DIZINI, exist_ok=True)
+os.makedirs(VERI_DIZINI, exist_ok=True)
+
+# oturum anahtarı
+if "CALISMA_UID" not in st.session_state:
+    st.session_state["CALISMA_UID"] = uuid.uuid4().hex
+
+# ------------------------- Yardımcılar -------------------------
+
+def _guvenli_karmas(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()[:10]
+
+def _anahtar_olustur(on_ek: str, *parcalar) -> str:
+    birlesik = "_".join([str(p) for p in parcalar if p is not None])
+    return f"{on_ek}_{birlesik}_{st.session_state['CALISMA_UID']}"
+
+def csv_indir_butonu(df: pd.DataFrame, belge_kimlik: int, sira: int, dosya_adi: str, on_ek: str = "csv"):
+    """
+    Her kullanımda BENZERSİZ key üretir. (on_ek + belge_kimlik + sira + sha1(csv) + CALISMA_UID)
+    """
+    csv_bayt = df.to_csv(index=False).encode("utf-8")
+    ozet = _guvenli_karmas(csv_bayt)
+    anahtar = _anahtar_olustur(on_ek, belge_kimlik, sira, ozet)
+    st.download_button(
+        label=f" CSV indir ({dosya_adi})",
+        data=csv_bayt,
+        file_name=dosya_adi,
+        mime="text/csv",
+        key=anahtar
+    )
+
+# ------------------------- Sözlükler -------------------------
+ESANLAM_KUMELERI = [
+    ["ISS","International Space Station","iss","space station","station"],
+    ["Shuttle","Space Shuttle"], ["Skylab"], ["Mir"], ["Gateway"], ["Salyut"], ["Soyuz"],
+    ["Human","humans","human"], ["Mouse","mice","mouse"], ["Rat","rats","rat"],
+    ["Arabidopsis","arabidopsis"], ["Plant","plants","plant"],
+    ["Yeast","yeast"], ["Bacteria","bacteria","E. coli","e. coli"],
+    ["Drosophila","drosophila","fruit fly","fly"],
+    ["Microgravity","microgravity","0 g","0g","spaceflight","space flight","iss"],
+    ["Radiation","radiation","hze","heavy ion","cosmic ray","gcr","proton","ion"],
+    ["Gene expression","gene expression","transcript","transcriptome"],
+    ["Bone loss","bone"], ["Muscle atrophy","muscle","sarcopenia"],
+    ["Photosynthesis","photosynthesis","chlorophyll","light"],
+    ["Root growth","root length","root","rhizogenesis"],
+    ["Germination","germination","seed","seedling"],
+    ["Oxidative stress","oxidative stress","ros"],
+    ["Immune","immune","immunity"], ["Microbiome","microbiome"]
+]
+IPUCLARI = ["significant","increase","increased","decrease","decreased","improved","enhanced","reduced",
+            "elevated","upregulated","downregulated","led to","resulted in","caused"]
+UC_NOKTALAR = ["growth","gene expression","transcript","protein","photosynthesis","chlorophyll","germination",
+               "root length","bone","muscle","immune","dna damage","dsb","oxidative stress","ros","microbiome","hormone","auxin"]
+
+ORGANIZMALAR = [
+    "human","humans","astronaut","mouse","mice","rat","rats","zebrafish",
+    "arabidopsis","plant","plants","yeast","bacteria","e. coli","drosophila",
+    "cell","cells","stem cell","seed","seedling","root","bone","muscle","blood"
+]
+CEVRE_TERIMLERI = [
+    "iss","international space station","spaceflight","space flight","microgravity","0 g","0g",
+    "clinostat","random positioning machine","rpm","centrifuge","1 g","ground control","shuttle",
+    "skylab","mir","gateway","salyut","soyuz","kibo","jaxa"
+]
+DONANIM_TERIMLERI = [
+    "veggie","advanced plant habitat","aph","melfi","minus eighty-degree laboratory freezer",
+    "microgravity science glovebox","msg","bioreactor","glovebox","rodent research","rr",
+    "kubik","bioserve","nanoracks","bioculture system","incubator","freezer","cold stowage"
+]
+DEG_SIMGE = {
+    "increase": +1, "increased": +1, "elevated": +1, "improved": +1, "enhanced": +1, "upregulated": +1,
+    "decrease": -1, "decreased": -1, "reduced": -1, "downregulated": -1
+}
+YIL_REGEX = re.compile(r"\b((?:19|20)\d{2})\b")
+
+# ------------------------- Model -------------------------
+@st.cache_resource(show_spinner=False)
+def modeli_getir():
+    return SentenceTransformer(MODEL_ADI)
+
+# ------------------------- Dosya Yardımcıları -------------------------
+
+def dosya_sha256(yol: str) -> str:
+    h = hashlib.sha256()
+    with open(yol, "rb") as f:
+        for b in iter(lambda: f.read(8192), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def pdf_oku(yol: str) -> str:
+    try:
+        r = PdfReader(yol)
+        if getattr(r, "is_encrypted", False):
+            try:
+                r.decrypt("")
+            except Exception:
+                pass
+        return "\n".join([(p.extract_text() or "") for p in r.pages])
+    except Exception:
+        return ""
+
+def txt_oku(yol: str) -> str:
+    try:
+        return open(yol, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return ""
+
+def metni_kelimelere_dilimle(metin: str, boyut=AZAMI_DILIM_KELIME, bindirme=DILIM_BINDIRME):
+    kelimeler = re.split(r"\s+", metin)
+    adim = max(50, boyut - bindirme)
+    for i in range(0, len(kelimeler), adim):
+        pencere = kelimeler[i:i+boyut]
+        if not pencere:
+            break
+        yield " ".join(pencere)
+
+def np_dizi_blob(a: np.ndarray) -> bytes:
+    return a.astype(np.float32).tobytes()
+
+def blob_np_dizi(b: bytes) -> np.ndarray:
+    return np.frombuffer(b, dtype=np.float32)
+
+def yerel_dosyalari_listele(kok: str) -> List[str]:
+    kaliplar = ["**/*.pdf", "**/*.PDF", "**/*.txt", "**/*.TXT"]
+    dosyalar = []
+    for p in kaliplar:
+        dosyalar += glob.glob(os.path.join(kok, p), recursive=True)
+    return sorted(list(dict.fromkeys(dosyalar)))
+
+# ------------------------- Veritabanı -------------------------
+
+def vt_guvence():
+    bag = sqlite3.connect(VT_YOLU)
+    im = bag.cursor()
+    im.execute("""CREATE TABLE IF NOT EXISTS docs(
+        doc_id INTEGER PRIMARY KEY,
+        title TEXT,
+        path TEXT UNIQUE,
+        sha256 TEXT,
+        n_chunks INTEGER,
+        created_at REAL,
+        source_url TEXT
+    )""")
+    im.execute("""CREATE TABLE IF NOT EXISTS chunks(
+        chunk_id INTEGER PRIMARY KEY,
+        doc_id INTEGER,
+        ord INTEGER,
+        text TEXT,
+        embedding BLOB
+    )""")
+    im.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id)")
+    # FTS5 etkinse
+    try:
+        im.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts 
+                       USING fts5(text, content='chunks', content_rowid='chunk_id')""")
+        im.execute("""CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+                         INSERT INTO chunks_fts(rowid, text) VALUES (new.chunk_id, new.text);
+                       END;""")
+        im.execute("""CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+                         INSERT INTO chunks_fts(chunks_fts, rowid, text)
+                         VALUES('delete', old.chunk_id, old.text);
+                       END;""")
+        im.execute("""CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+                         INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
+                       END;""")
+    except sqlite3.OperationalError:
+        pass
+    bag.commit()
+    return bag
+
+# ------------------------- İndeksleme -------------------------
+
+def yerel_klasoru_indeksle(bag, model, kok_dizin: str) -> int:
+    im = bag.cursor()
+    varolan = {satir[0]: (satir[1], satir[2]) for satir in im.execute(
+        "SELECT path, sha256, doc_id FROM docs"
+    )}
+    dosyalar = yerel_dosyalari_listele(kok_dizin)
+    yeni_adet = 0
+
+    ilerleme = st.progress(0, text="Yerel dosyalar indeksleniyor…")
+    toplam = max(1, len(dosyalar))
+
+    for i, yol in enumerate(dosyalar, start=1):
+        try:
+            sha = dosya_sha256(yol)
+            satir = varolan.get(yol)
+            if satir and satir[0] == sha:
+                ilerleme.progress(int(i*100/toplam), text=f"İndeksli: {i}/{toplam}")
+                continue
+            if satir:
+                im.execute("DELETE FROM chunks WHERE doc_id=?", (satir[1],))
+                im.execute("DELETE FROM docs WHERE doc_id=?", (satir[1],))
+                bag.commit()
+
+            metin = pdf_oku(yol) if yol.lower().endswith(".pdf") else txt_oku(yol)
+            if not metin.strip():
+                ilerleme.progress(int(i*100/toplam), text=f"Boş/okunamadı: {i}/{toplam}")
+                continue
+
+            dilimler = list(metni_kelimelere_dilimle(metin))
+            if not dilimler:
+                ilerleme.progress(int(i*100/toplam), text=f"Parça yok: {i}/{toplam}")
+                continue
+
+            baslik = pathlib.Path(yol).stem
+            im.execute("""INSERT INTO docs(title, path, sha256, n_chunks, created_at, source_url) 
+                           VALUES(?,?,?,?,?,?)""",
+                        (baslik, yol, sha, len(dilimler), time.time(), ""))
+            belge_kimlik = im.lastrowid
+
+            gomuler = model.encode(
+                dilimler, batch_size=64, convert_to_numpy=True,
+                normalize_embeddings=True, show_progress_bar=False
+            )
+            im.executemany("INSERT INTO chunks(doc_id, ord, text, embedding) VALUES(?,?,?,?)", [
+                (belge_kimlik, j, ch, np_dizi_blob(vec)) for j, (ch, vec) in enumerate(zip(dilimler, gomuler))
+            ])
+            bag.commit()
+            yeni_adet += 1
+            ilerleme.progress(int(i*100/toplam), text=f"Eklendi: {i}/{toplam}")
+        except Exception:
+            ilerleme.progress(int(i*100/toplam), text=f"Hata/atlandı: {i}/{toplam}")
+            continue
+
+    return yeni_adet
+
+# ------------------------- Doğal Dil İşleme -------------------------
+
+def sorgu_genislet(s: str) -> List[str]:
+    jetonlar = [t.strip().lower() for t in re.split(r"[,\|;]+", s) if t.strip()]
+    genis = set(jetonlar)
+    for kume in ESANLAM_KUMELERI:
+        alt = [w.lower() for w in kume]
+        if any(w in genis for w in alt):
+            genis.update(alt)
+    return sorted(genis)
+
+def cumleler(metin: str) -> List[str]:
+    c = re.split(r'(?<=[\.!\?])\s+', metin.strip())
+    return [s.strip() for s in c if s.strip()]
+
+def cumleleri_ozetle(cumle_list: List[str], sorgu: str, azami_cumle=OZET_CUMLE_ADEDI) -> str:
+    if not cumle_list:
+        return ""
+    model = modeli_getir()
+    q_vec = model.encode([sorgu], convert_to_numpy=True, normalize_embeddings=True)[0]
+    s_vecs = model.encode(cumle_list, convert_to_numpy=True, normalize_embeddings=True)
+    sem = np.dot(s_vecs, q_vec)
+    uzunluklar = np.array([max(5, min(40, len(s.split()))) for s in cumle_list], dtype=np.float32)
+    puan = sem * 0.9 + (1 / np.sqrt(uzunluklar)) * 0.1
+    idx = np.argsort(-puan)[:azami_cumle]
+    return " ".join([cumle_list[i] for i in idx])
+
+def bulgulari_cikar(metin: str) -> List[str]:
+    """
+    Genişletilmiş çıkarım:
+    - uç_nokta/ipucu VARSA
+    - VEYA sayısal ipucu (p, %, ±, fold, doz, n=, süre, Gy/Sv, µM/mM vb.) VARSA
+    """
+    ep_alt = [e.lower() for e in UC_NOKTALAR]
+    sayisal_kalip = re.compile(
+        r"(?:\bp\s*[<=>]\s*0\.\d+\b|"
+        r"\b\d{1,3}\s*%|\b\d+(\.\d+)?\s*±\s*\d+(\.\d+)?\b|"
+        r"\b\d+(\.\d+)?\s*-?\s*fold\b|"
+        r"\bn\s*=\s*\d+\b|"
+        r"\b\d+(\.\d+)?\s*(Gy|cGy|mGy|Sv|mSv)\b|"
+        r"\b\d+(\.\d+)?\s*(nM|µM|uM|mM|mg/kg|µg/mL|ug/mL|ng/mL)\b|"
+        r"\b\d+(\.\d+)?\s*(h|hr|hour|hours|d|day|days|wk|week|weeks)\b"
+        r")",
+        re.IGNORECASE
+    )
+
+    cikti = []
+    for s in cumleler(metin):
+        low = s.lower()
+        if (any(c in low for c in IPUCLARI) or any(e in low for e in ep_alt) or sayisal_kalip.search(s)):
+            cikti.append(s.strip())
+
+    # benzersiz + sınırla
+    gorulen, ozgun = set(), []
+    for s in cikti:
+        anahtar = " ".join(s.split())
+        if anahtar not in gorulen:
+            ozgun.append(s); gorulen.add(anahtar)
+    return ozgun[:40]
+
+def herhangi_icerir(metin: str, sozluk: List[str]) -> List[str]:
+    low = metin.lower()
+    return [w for w in sozluk if w in low]
+
+def yillari_tahmin_et(metin: str) -> List[int]:
+    return [int(y) for y in YIL_REGEX.findall(metin)]
+
+def korpusu_analiz_et(cumle_list: List[str]) -> Dict[str, Dict]:
+    from collections import Counter, defaultdict
+    yillar = Counter(); organizma = Counter(); cevre = Counter(); donanim = Counter()
+    uc = Counter(); delta_uc = defaultdict(int)
+    ep_alt = [e.lower() for e in UC_NOKTALAR]
+    for s in cumle_list:
+        low = s.lower()
+        for y in yillari_tahmin_et(s): yillar[y] += 1
+        for w in herhangi_icerir(low, ORGANIZMALAR): organizma[w] += 1
+        for w in herhangi_icerir(low, CEVRE_TERIMLERI): cevre[w] += 1
+        for w in herhangi_icerir(low, DONANIM_TERIMLERI): donanim[w] += 1
+        for w in herhangi_icerir(low, ep_alt): uc[w] += 1
+        isaret = 0
+        for k, v in DEG_SIMGE.items():
+            if k in low:
+                isaret = v
+                break
+        if isaret != 0:
+            for e in ep_alt:
+                if e in low: delta_uc[e] += isaret
+    return {"years": yillar, "organisms": organizma, "envs": cevre, "hardware": donanim,
+            "endpoints": uc, "delta_by_endpoint": delta_uc}
+
+def belge_bulgularini_analiz_et(cumle_list: List[str]) -> Dict[str, Dict]:
+    from collections import Counter, defaultdict
+    uc = Counter(); delta_uc = defaultdict(int)
+    cevre = Counter(); donanim = Counter(); yon_sayim = Counter()
+    ep_alt = [e.lower() for e in UC_NOKTALAR]
+    for s in cumle_list:
+        low = s.lower()
+        for w in herhangi_icerir(low, ep_alt): uc[w] += 1
+        isaret = 0
+        for k, v in DEG_SIMGE.items():
+            if k in low:
+                isaret = v
+                yon_sayim["increase" if v == 1 else "decrease"] += 1
+                break
+        if isaret != 0:
+            for e in ep_alt:
+                if e in low: delta_uc[e] += isaret
+        for w in herhangi_icerir(low, CEVRE_TERIMLERI): cevre[w] += 1
+        for w in herhangi_icerir(low, DONANIM_TERIMLERI):  donanim[w] += 1
+    return {"endpoints": uc, "delta_by_endpoint": delta_uc,
+            "envs": cevre, "hardware": donanim, "posneg": yon_sayim}
+
+# ------------------------- Deney Tablosu Çıkarımı -------------------------
+AYRINTILI_DEGER_KALIPLARI = [
+    (r"\bp\s*[<=>]\s*0\.\d+\b", "p_degeri"),
+    (r"\b\d{1,3}\s*%\b", "yuzde"),
+    (r"\b\d+(\.\d+)?\s*-?\s*fold\b", "kat_degisim"),
+    (r"\b\d+(\.\d+)?\s*±\s*\d+(\.\d+)?\b", "ortalama_artieksik"),
+    (r"\b\d+(\.\d+)?\s*[-–]\s*\d+(\.\d+)?\b", "aralik"),
+    (r"\b\d+(\.\d+)?\s*(Gy|cGy|mGy|Sv|mSv)\b", "doz"),
+    (r"\b\d+(\.\d+)?\s*(nM|µM|uM|mM|mg/kg|µg/mL|ug/mL|ng/mL)\b", "konsantrasyon"),
+    (r"\b\d+(\.\d+)?\s*(h|hr|hour|hours|d|day|days|wk|week|weeks)\b", "sure"),
+    (r"\b\d+(\.\d+)?\s*rpm\b", "rpm"),
+    (r"\b\d+(\.\d+)?\s*°C\b", "sicaklik"),
+    (r"\b(1\sg|microgravity|micro-gravity|µg|0g|0\sg)\b", "g_seviyesi"),
+    (r"\bn\s*=\s*\d+\b", "ornek_sayisi"),
+]
+BOLUM_IPUCLARI = {
+    "methods":  ["method","methods","protocol","assay","measured","we used","we cultured"],
+    "results":  ["result","results","finding","observed","we found","data show"],
+    "conclusion":["conclusion","in summary","in conclusion","overall","collectively"],
+    "discussion":["discussion","suggests","we propose","we speculate"]
+}
+
+def bolumu_yumusak_tahmin_et(s: str) -> str:
+    low = s.lower()
+    puan = {k:0 for k in BOLUM_IPUCLARI}
+    for bolum, ip in BOLUM_IPUCLARI.items():
+        for c in ip:
+            if c in low: puan[bolum]+=1
+    eniy = max(puan, key=puan.get)
+    return eniy if sum(puan.values())>0 else "results"
+
+def birimi_normalize_et(deger: str) -> str:
+    if not deger: return ""
+    return deger.replace("µ","u").replace("–","-").replace("−","-")
+
+def cumleden_satir_cikar(s: str) -> Dict[str,str]:
+    low = s.lower()
+    satir = {
+        "organizma": "; ".join(herhangi_icerir(low, ORGANIZMALAR)),
+        "ortam":     "; ".join(herhangi_icerir(low, CEVRE_TERIMLERI)),
+        "donanım":   "; ".join(herhangi_icerir(low, DONANIM_TERIMLERI)),
+        "endpoint":  "; ".join(herhangi_icerir(low, [e.lower() for e in UC_NOKTALAR])),
+        "yön":       "",
+        "değer":     "",
+        "birim":     "",
+        "yüzde/kat": "",
+        "p":         "",
+        "doz/maruziyet": "",
+        "süre":      "",
+        "n":         "",
+        "yöntem/ipucu": "",
+        "referans/aralık": "",
+        "bölüm":     bolumu_yumusak_tahmin_et(s),
+        "alıntı":    s.strip()
+    }
+    for k, v in DEG_SIMGE.items():
+        if k in low:
+            satir["yön"] = "artış" if v==1 else "azalış"
+            break
+    for kalip, anahtar in AYRINTILI_DEGER_KALIPLARI:
+        m = re.search(kalip, s, flags=re.IGNORECASE)
+        if not m: continue
+        isabet = birimi_normalize_et(m.group(0))
+        if anahtar == "p_degeri":
+            satir["p"] = isabet
+        elif anahtar in ("yuzde","kat_degisim"):
+            satir["yüzde/kat"] = (satir["yüzde/kat"]+"; " if satir["yüzde/kat"] else "") + isabet
+        elif anahtar == "doz":
+            satir["doz/maruziyet"] = isabet
+        elif anahtar == "konsantrasyon":
+            satir["birim"] = (satir["birim"]+"; " if satir["birim"] else "") + isabet
+        elif anahtar == "sure":
+            satir["süre"] = isabet
+        elif anahtar in ("rpm","sicaklik"):
+            satir["yöntem/ipucu"] = (satir["yöntem/ipucu"]+"; " if satir["yöntem/ipucu"] else "") + isabet
+        elif anahtar == "g_seviyesi":
+            satir["ortam"] = (satir["ortam"]+"; " if satir["ortam"] else "") + isabet
+        elif anahtar == "ornek_sayisi":
+            satir["n"] = isabet
+        elif anahtar == "ortalama_artieksik":
+            satir["değer"] = isabet
+        elif anahtar == "aralik":
+            satir["referans/aralık"] = isabet
+    return satir
+
+def deney_tablosu_olustur(aday_metinler: List[str]) -> pd.DataFrame:
+    satirlar = bulgulari_cikar(" ".join(aday_metinler))
+    satirlar_df = [cumleden_satir_cikar(s) for s in satirlar] if satirlar else []
+    df = pd.DataFrame(satirlar_df) if satirlar_df else pd.DataFrame(columns=[
+        "organizma","ortam","donanım","endpoint","yön","değer","birim",
+        "yüzde/kat","p","doz/maruziyet","süre","n","yöntem/ipucu","referans/aralık","bölüm","alıntı"
+    ])
+    sutun_sirasi = ["organizma","ortam","donanım","endpoint","yön","değer","birim",
+                    "yüzde/kat","p","doz/maruziyet","süre","n","yöntem/ipucu","referans/aralık","bölüm","alıntı"]
+    return df.reindex(columns=sutun_sirasi)
+
+def sekil_atiflarini_bul(aday_metinler: List[str]) -> List[str]:
+    metin = " ".join(aday_metinler)
+    adaylar = []
+    for s in cumleler(metin):
+        if re.search(r"\b(Fig\.|Figure)\s*\d+[A-Za-z]?\b", s):
+            adaylar.append(s.strip())
+    return adaylar[:10]
+
+# ------------------------- Arama -------------------------
+
+def anlamsal_arama(bag, sorgu: str, en_iyi=ENIYI_DILIM_SAYISI):
+    terimler = sorgu_genislet(sorgu)
+    im = bag.cursor()
+    # FTS5 varsa MATCH, yoksa LIKE
+    try:
+        match_s = " OR ".join([f'"{t}"' for t in (terimler or [sorgu])])
+        on_satirlar = im.execute("""
+            SELECT c.chunk_id, c.doc_id, c.ord, c.text, c.embedding
+            FROM chunks_fts f JOIN chunks c ON c.chunk_id = f.rowid
+            WHERE chunks_fts MATCH ?
+            LIMIT ?
+        """, (match_s, max(200, en_iyi*5))).fetchall()
+    except sqlite3.OperationalError:
+        like_terimleri = terimler or [w.strip() for w in re.split(r"\s+", sorgu) if w.strip()]
+        like_ifade   = " OR ".join(["LOWER(text) LIKE ?"] * len(like_terimleri))
+        like_args    = [f"%{t.lower()}%" for t in like_terimleri]
+        on_satirlar = im.execute(f"""
+            SELECT chunk_id, doc_id, ord, text, embedding FROM chunks
+            WHERE {like_ifade}
+            LIMIT ?
+        """, (*like_args, max(400, en_iyi*8))).fetchall()
+
+    if not on_satirlar:
+        return []
+
+    q_vec = modeli_getir().encode([sorgu], convert_to_numpy=True, normalize_embeddings=True)[0]
+    puanli = []
+    for (chunk_id, doc_id, siralama, metin, gomuleme) in on_satirlar:
+        v = np.frombuffer(gomuleme, dtype=np.float32)
+        sem = float(np.dot(q_vec, v))
+        puanli.append((sem, doc_id, siralama, metin))
+    puanli.sort(reverse=True, key=lambda x: x[0])
+    return puanli[:en_iyi]
+
+# ------------------------- Stil & Banner -------------------------
+
+def css_yukle():
+    st.markdown("""
+    <style>
+      .stApp {
+        background: linear-gradient(120deg, #0b1220, #0f1b2d, #101828);
+        background-size: 300% 300%;
+        animation: bgmove 16s ease infinite;
+      }
+      @keyframes bgmove { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+
+      .glass {
+        background: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.12);
+        backdrop-filter: blur(10px);
+        border-radius: 16px;
+        padding: 14px 16px;
+      }
+
+      .pathbox {
+        font-family: ui-monospace, Menlo, Consolas, monospace; font-size:12px; color:#d9e1f2;
+        background: rgba(0,0,0,.35); padding:8px 10px; border-radius:10px;
+        border:1px solid rgba(255,255,255,.12);
+      }
+
+      .hero-title {
+        font-size: 32px; font-weight: 800;
+        background: linear-gradient(90deg, #e2f3ff, #9bdcff, #64b5ff);
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+      }
+      .hero-sub { color:#b6c2d9; font-size:13px; margin-top:4px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def afis_img_base64(yol: str) -> str:
+    try:
+        with open(yol, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return ""
+
+def afis_ciz(yol: str, genislik_px: int = 1000):
+    src = afis_img_base64(yol)
+    if not src:
+        st.warning("Logo bulunamadı veya okunamadı.")
+        return
+    st.markdown(
+        f"""
+        <div style="text-align:center; margin: 18px 0 10px 0;">
+            <img src="{src}" style="width:{genislik_px}px; max-width:95%; border-radius:16px; box-shadow:0 10px 40px rgba(0,0,0,.35);" />
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def kenarcubuk_resim_goster(yol: str, azami_px: int = 260):
+    """Sidebar’da butonun altında dikey görseli merkezli gösterir."""
+    try:
+        with open(yol, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        st.sidebar.markdown(
+            f"""
+            <div style="margin-top:14px; display:flex; justify-content:center;">
+              <img src="data:image/png;base64,{b64}"
+                   style="width:100%; max-width:{azami_px}px; height:auto;
+                          border-radius:14px; box-shadow:0 8px 28px rgba(0,0,0,.25);" />
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    except Exception:
+        st.sidebar.caption(f"Görsel yüklenemedi: {yol}")
+
+# ------------------------- Arayüz -------------------------
+css_yukle()
+afis_ciz(UYGULAMA_LOGO_YOLU, AFIS_GENISLIK_PX)
+
+st.markdown(
+    """
+<div class="hero-title" style="text-align:center;">Space Biology Knowledge Engine</div>
+<div class="hero-sub" style="text-align:center;">Yerel PDF/TXT → embedding arama → özet & analitik</div>
+""",
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.markdown("Kaynak Klasör")
+    yerel_dizin_girdi = st.text_input("Yol", value=VERI_DIZINI)
+    st.caption("Alt klasörler dahil taranır. DB, _INDEX_CACHE içinde.")
+    yeniden_indeksle = st.button(" Klasörü Tara & Dizinle")
+    kenarcubuk_resim_goster(ATA_GORSEL_YOLU)
+
+st.markdown(
+    f"<div class='glass' style='margin-top:10px;'>Kaynak klasör: <span class='pathbox'>{VERI_DIZINI}</span></div>",
+    unsafe_allow_html=True,
+)
+
+# ------------------------- Çekirdek Akış -------------------------
+baglanti = vt_guvence()
+model = modeli_getir()
+
+if yeniden_indeksle:
+    with st.status(" Dizin hazırlanıyor…", expanded=False) as durum:
+        eklenen = yerel_klasoru_indeksle(baglanti, model, yerel_dizin_girdi)
+        durum.update(label=f" Dizin hazır. Yeni indekslenen dosya: {eklenen}", state="complete")
+else:
+    st.info("Yan panelden 'Klasörü Tara & Dizinle' butonuna basın.")
+
+st.markdown("Arama")
+sorgu = st.text_input(
+    "Anahtar kelimeleri yazın",
+    "",
+    placeholder="Örnek: microgravity, plant, gene expression, ISS, radiation, Arabidopsis",
+)
+
+if sorgu.strip():
+    sonuc_dilimler = anlamsal_arama(baglanti, sorgu)
+    if not sonuc_dilimler:
+        st.warning("Eşleşme bulunamadı. Farklı anahtar kelimeler deneyin.")
+    else:
+        # belge bazlı gruplama
+        belgeye_gore: Dict[int, List[Tuple]] = {}
+        for (puan, belge_kimlik, sira, metin) in sonuc_dilimler:
+            belgeye_gore.setdefault(belge_kimlik, []).append((puan, metin, sira))
+
+        belge_puanli = []
+        for belge_kimlik, ogeler in belgeye_gore.items():
+            ogeler.sort(reverse=True, key=lambda x: x[0])
+            belge_puani = float(np.mean([x[0] for x in ogeler[:min(5, len(ogeler))]]))
+            belge_puanli.append((belge_puani, belge_kimlik, [t for _, t, __ in ogeler]))
+        belge_puanli.sort(reverse=True, key=lambda x: x[0])
+        belge_puanli = belge_puanli[:ENIYI_KAYNAK_SAYISI]
+
+        st.subheader(f"Eşleşen Yayınlar ({len(belge_puanli)})")
+        tum_cumleler_analitik: List[str] = []
+
+        for sira, (belge_puani, belge_kimlik, metinler) in enumerate(belge_puanli, start=1):
+            satir = baglanti.execute("SELECT title, path, source_url FROM docs WHERE doc_id=?", (belge_kimlik,)).fetchone()
+            baslik = satir[0] if satir and satir[0] else f"Belge {belge_kimlik}"
+            kaynak_yol = satir[1] if satir else ""
+            with st.expander(f"{sira}. {baslik}"):
+                onizleme = " ".join([re.sub(r'\s+', ' ', t) for t in metinler[:2]])[:600]
+                st.write(onizleme + ("..." if len(onizleme) == 600 else ""))
+
+                if kaynak_yol:
+                    st.markdown(
+                        f"**Dosya yolu:**  \n<span class='pathbox'>{kaynak_yol}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+                # Özet
+                st.markdown("**Özet (AI, 5–10 cümle):**")
+                belge_cumleleri = []
+                for tx in metinler[:6]:
+                    c = cumleler(tx)
+                    belge_cumleleri += c
+                    tum_cumleler_analitik += c
+                st.info(cumleleri_ozetle(belge_cumleleri, sorgu, azami_cumle=OZET_CUMLE_ADEDI) or "Özet çıkarılamadı.")
+
+                # Bulgular
+                st.markdown("**Deney Sonuçları / Bulgular:**")
+                bulgu_cumleleri = bulgulari_cikar(" ".join(metinler[:12]))
+                if bulgu_cumleleri:
+                    for r in bulgu_cumleleri:
+                        st.write("- " + r)
+                else:
+                    st.write("_Açık sonuç cümlesi tespit edilemedi._")
+
+                # Detaylı Deney Tablosu
+                st.markdown("** Detaylı Deney Tablosu**")
+                detay_df = deney_tablosu_olustur(metinler[:24])
+                if not detay_df.empty:
+                    st.caption(f"Yakalanan satır: **{len(detay_df)}**")
+                    st.dataframe(detay_df, width='stretch', hide_index=True)
+                    csv_indir_butonu(detay_df, belge_kimlik=belge_kimlik, sira=sira, dosya_adi=f"deney_detaylari_doc{belge_kimlik}.csv")
+                else:
+                    st.info("Bu yayında otomatik çıkarılabilen yapılandırılmış deney satırı bulunamadı.")
+
+                # Şekil/Görsel referansları
+                fig_ref = sekil_atiflarini_bul(metinler[:24])
+                if fig_ref:
+                    with st.expander("Makaledeki Şekil/‘Figure’ referansları"):
+                        for fr in fig_ref:
+                            st.write("• " + fr)
+
+                # Grafik & tablolar
+                if bulgu_cumleleri:
+                    bulgu_istat = belge_bulgularini_analiz_et(bulgu_cumleleri)
+
+                    c1, c2 = st.columns(2)
+                    if bulgu_istat["endpoints"]:
+                        df_ep_doc = pd.DataFrame(
+                            sorted(bulgu_istat["endpoints"].items(), key=lambda x: x[1], reverse=True),
+                            columns=["endpoint", "adet"]
+                        ).set_index("endpoint")
+                        c1.bar_chart(df_ep_doc)
+                    else:
+                        c1.info("Endpoint bulunamadı.")
+
+                    if bulgu_istat["delta_by_endpoint"]:
+                        df_delta_doc = pd.DataFrame(
+                            sorted(bulgu_istat["delta_by_endpoint"].items(), key=lambda x: abs(x[1]), reverse=True),
+                            columns=["endpoint", "net_değişim_(+artış/−azalış)"]
+                        ).set_index("endpoint")
+                        c2.bar_chart(df_delta_doc)
+                    else:
+                        c2.info("Artış/Azalış sinyali yok.")
+
+                    t1, t2, t3 = st.columns(3)
+                    if bulgu_istat["hardware"]:
+                        df_h = pd.DataFrame(
+                            sorted(bulgu_istat["hardware"].items(), key=lambda x: x[1], reverse=True),
+                            columns=["Donanım", "Adet"]
+                        )
+                        t1.dataframe(df_h, width='stretch', hide_index=True)
+                    else:
+                        t1.info("Donanım sinyali yok.")
+
+                    if bulgu_istat["envs"]:
+                        df_e = pd.DataFrame(
+                            sorted(bulgu_istat["envs"].items(), key=lambda x: x[1], reverse=True),
+                            columns=["Ortam/Koşul", "Adet"]
+                        )
+                        t2.dataframe(df_e, width='stretch', hide_index=True)
+                    else:
+                        t2.info("Ortam sinyali yok.")
+
+                    art = bulgu_istat["posneg"].get("increase", 0)
+                    azal = bulgu_istat["posneg"].get("decrease", 0)
+                    df_isaret = pd.DataFrame({"Tür": ["Artış (+)", "Azalış (−)"], "Adet": [art, azal]})
+                    t3.dataframe(df_isaret, width='stretch', hide_index=True)
+
+        # Sorgu genel analitiği
+        if tum_cumleler_analitik:
+            ist = korpusu_analiz_et(tum_cumleler_analitik)
+            st.markdown("Sonuç Analitiği")
+            col1, col2 = st.columns(2)
+            with col1:
+                if ist["endpoints"]:
+                    df_ep = pd.DataFrame(
+                        sorted(ist["endpoints"].items(), key=lambda x: x[1], reverse=True)[:10],
+                        columns=["endpoint","adet"]
+                    ).set_index("endpoint")
+                    st.write("**Uç Noktalar (en çok geçen 10)**")
+                    st.bar_chart(df_ep)
+                else:
+                    st.info("Endpoint sinyali bulunamadı.")
+            with col2:
+                if ist["delta_by_endpoint"]:
+                    df_delta = pd.DataFrame(
+                        sorted(ist["delta_by_endpoint"].items(), key=lambda x: abs(x[1]), reverse=True)[:10],
+                        columns=["endpoint","net_değişim_(+artış/−azalış)"]
+                    ).set_index("endpoint")
+                    st.write("**Uç Nokta Bazında Net Değişim** *(pozitif: artış, negatif: azalış)*")
+                    st.bar_chart(df_delta)
+                else:
+                    st.info("Artış/Azalış sinyali yakalanamadı.")
+            col3, col4 = st.columns(2)
+            with col3:
+                if ist["organisms"]:
+                    df_org = pd.DataFrame(
+                        sorted(ist["organisms"].items(), key=lambda x: x[1], reverse=True)[:10],
+                        columns=["organizma","adet"]
+                    ).set_index("organizma")
+                    st.write("**Organizmalar**")
+                    st.bar_chart(df_org)
+                else:
+                    st.info("Organizma sinyali yok.")
+            with col4:
+                en_iyi_cevre = sorted(ist["envs"].items(), key=lambda x: x[1], reverse=True)[:7]
+                en_iyi_donanim  = sorted(ist["hardware"].items(), key=lambda x: x[1], reverse=True)[:7]
+                if en_iyi_cevre:
+                    df_env = pd.DataFrame(en_iyi_cevre, columns=["terim","adet"]).set_index("terim")
+                    st.write("**Ortam/Koşullar**")
+                    st.bar_chart(df_env)
+                if en_iyi_donanim:
+                    df_hd  = pd.DataFrame(en_iyi_donanim,  columns=["donanım","adet"]).set_index("donanım")
+                    st.write("**Araç & Gereç**")
+                    st.bar_chart(df_hd)
+            if ist["years"]:
+                df_yil = (pd.DataFrame(ist["years"].items(), columns=["yıl","adet"]).sort_values("yıl").set_index("yıl"))
+                st.write("**Yıllara Göre Çalışma Geçişleri**")
+                st.line_chart(df_yil)
+        else:
+            st.info("Analitik için yeterli metin toplanamadı.")
+else:
+    st.info("Yan panelden klasörü tarat, sonra anahtar kelimeleri yaz.")
